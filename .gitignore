@@ -1,0 +1,6 @@
+.venv/
+.devenv/
+__pycache__/
+*.pyc
+.DS_Store
+/gradio_tmp/
