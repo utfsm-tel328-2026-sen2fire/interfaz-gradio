@@ -1,10 +1,9 @@
-import gradio as gr
+﻿import gradio as gr
 import numpy as np
 import cv2
 import torch
 from burn_scar.models.propagation import BurnScarPropagationModel
 
-# --- 1. CARGA ÚNICA DEL MODELO ENTRENADO ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CKPT_PATH = "weights/best_fold_0.pt"
 
@@ -16,7 +15,6 @@ model = BurnScarPropagationModel(**MODEL_CONFIG).to(DEVICE)
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
 
-# CSS para mantener la estética limpia con bordes definidos
 custom_css = """
 .sat-box {
     border: 2px dashed #94a3b8 !important;
@@ -36,15 +34,63 @@ custom_css = """
 }
 """
 
-def hacer_mapa_calor(matriz_64x64):
-    """Convierte matriz (64, 64) en [0, 1] a mapa de calor RGB reescalado a 320x320."""
-    matriz_uint8 = np.clip(matriz_64x64 * 255, 0, 255).astype(np.uint8)
-    mapa_bgr = cv2.applyColorMap(matriz_uint8, cv2.COLORMAP_INFERNO)
-    mapa_rgb = cv2.cvtColor(mapa_bgr, cv2.COLOR_BGR2RGB)
-    return cv2.resize(mapa_rgb, (320, 320), interpolation=cv2.INTER_NEAREST)
+
+def crear_fondo_terreno(olci_norm: np.ndarray, dem_norm: np.ndarray) -> np.ndarray:
+    banda_sat = olci_norm[-1, 0]
+    p2, p98 = np.percentile(banda_sat, (2, 98))
+    sat_gris = np.clip((banda_sat - p2) / (p98 - p2 + 1e-6), 0.0, 1.0)
+
+    dem_2d = dem_norm.squeeze()
+    d_min, d_max = dem_2d.min(), dem_2d.max()
+    relieve = (dem_2d - d_min) / (d_max - d_min + 1e-6)
+
+    base = np.clip(0.75 * sat_gris + 0.25 * relieve, 0.15, 0.88)
+    return np.stack([base, base, base], axis=-1)
+
+
+def renderizar_scar(fondo: np.ndarray, scar_2d: np.ndarray) -> np.ndarray:
+    canvas = fondo.copy()
+    mask = scar_2d > 0.5
+    color_scar = np.array([0.98, 0.25, 0.09], dtype=np.float32)
+    canvas[mask] = 0.25 * canvas[mask] + 0.75 * color_scar
+    img_uint8 = np.clip(canvas * 255, 0, 255).astype(np.uint8)
+    return cv2.resize(img_uint8, (350, 350), interpolation=cv2.INTER_NEAREST)
+
+
+def renderizar_prediccion(
+    fondo: np.ndarray,
+    scar_2d: np.ndarray,
+    prob_2d: np.ndarray,
+    umbral: float,
+    target_2d: np.ndarray | None = None,
+) -> np.ndarray:
+    canvas = fondo.copy()
+
+    mask_scar = scar_2d > 0.5
+    color_base = np.array([0.72, 0.11, 0.11], dtype=np.float32)
+    canvas[mask_scar] = 0.30 * canvas[mask_scar] + 0.70 * color_base
+
+    mask_pred = prob_2d > umbral
+    if np.any(mask_pred):
+        intensidad = np.clip((prob_2d - umbral) / (1.0 - umbral + 1e-6), 0.35, 1.0)
+        r = np.ones_like(prob_2d)
+        g = 0.95 - 0.35 * intensidad
+        b = 0.05 * np.ones_like(prob_2d)
+        color_pred = np.stack([r, g, b], axis=-1)
+        canvas[mask_pred] = 0.15 * canvas[mask_pred] + 0.85 * color_pred[mask_pred]
+
+    img_uint8 = np.clip(canvas * 255, 0, 255).astype(np.uint8)
+    img_big = cv2.resize(img_uint8, (350, 350), interpolation=cv2.INTER_NEAREST)
+
+    if target_2d is not None and np.any(target_2d > 0.5):
+        gt_big = cv2.resize((target_2d > 0.5).astype(np.uint8), (350, 350), interpolation=cv2.INTER_NEAREST)
+        contornos, _ = cv2.findContours(gt_big, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img_big, contornos, -1, (0, 255, 255), 2)
+
+    return img_big
+
 
 def preprocesar_olci(olci_raw: np.ndarray) -> np.ndarray:
-    """Rellena NaNs con la media de su banda en ese frame y normaliza radiancia / 1000."""
     olci = olci_raw.astype(np.float32).copy()
     if olci.shape[0] < 7:
         faltantes = 7 - olci.shape[0]
@@ -58,9 +104,13 @@ def preprocesar_olci(olci_raw: np.ndarray) -> np.ndarray:
                 banda[np.isnan(banda)] = 0.0 if np.isnan(media) else media
     return olci / 1000.0
 
+
 def predecir_incendio(archivo_npz, h_usuario):
     if archivo_npz is None:
         return None, None, "Pendiente: Carga un archivo satelital (.npz) para ejecutar la inferencia."
+
+    if h_usuario is None or float(h_usuario) <= 0:
+        return None, None, "Error: Ingresa un horizonte temporal (H) mayor a 0 días (ej. 0.5, 1.0, 2.0, 5.0)."
 
     try:
         datos = np.load(archivo_npz.name)
@@ -72,15 +122,13 @@ def predecir_incendio(archivo_npz, h_usuario):
     if faltantes:
         return None, None, f"Error: El archivo .npz no contiene las claves esperadas: {faltantes}"
 
-    # 1. Preprocesamiento según contrato del modelo
-    olci = preprocesar_olci(datos["x_olci"])                      # (7, 5, 64, 64)
-    dem = datos["x_dem"].astype(np.float32) / 1000.0              # metros -> km
+    olci = preprocesar_olci(datos["x_olci"])
+    dem = datos["x_dem"].astype(np.float32) / 1000.0
     wc_raw = datos["x_worldcover"].astype(np.float32)
-    valid_fuel = wc_raw > 0                                       # clase 0 = sin dato/combustible
+    valid_fuel = wc_raw > 0
     wc = np.where(valid_fuel, wc_raw / 100.0, 0.0)
     scar = datos["x_scar"].astype(np.float32)
 
-    # Asegurar forma (1, 64, 64) en capas 2D
     if dem.ndim == 2:
         dem = dem[None]
     if wc.ndim == 2:
@@ -88,15 +136,9 @@ def predecir_incendio(archivo_npz, h_usuario):
     if scar.ndim == 2:
         scar = scar[None]
 
-    # Usar días ingresados por el usuario o el horizonte propio del archivo si es <= 0
-    if h_usuario is not None and h_usuario > 0:
-        h_final = float(h_usuario)
-    elif "horizon_days" in datos:
-        h_final = float(datos["horizon_days"])
-    else:
-        h_final = 2.0
+    h_final = float(h_usuario)
+    h_archivo = float(datos["horizon_days"]) if "horizon_days" in datos else None
 
-    # 2. Inferencia con PyTorch
     with torch.no_grad():
         t_olci = torch.from_numpy(olci[None]).to(DEVICE)
         t_dem = torch.from_numpy(dem[None]).to(DEVICE)
@@ -107,29 +149,31 @@ def predecir_incendio(archivo_npz, h_usuario):
         logits = model(t_olci, t_dem, t_wc, t_scar, t_h)
         prob_quema = torch.sigmoid(logits).squeeze().cpu().numpy()
 
-    # Descartar zonas sin dato de combustible (clase WC == 0)
     prob_quema = np.where(valid_fuel, prob_quema, 0.0)
+    target_2d = datos["target"].squeeze() if "target" in datos else None
 
-    # 3. Visualización y cálculo de hectáreas (1 píxel 300x300m = 9 ha)
-    img_scar = hacer_mapa_calor(scar.squeeze())
-    img_pred = hacer_mapa_calor(prob_quema)
+    fondo = crear_fondo_terreno(olci, dem)
+    img_scar = renderizar_scar(fondo, scar.squeeze())
+    img_pred = renderizar_prediccion(fondo, scar.squeeze(), prob_quema, BEST_THRESHOLD, target_2d)
 
     pixeles_actuales = int(np.sum(scar.squeeze() > 0.5))
     pixeles_nuevos = int(np.sum(prob_quema > BEST_THRESHOLD))
     ha_actuales = pixeles_actuales * 9
     ha_nuevas = pixeles_nuevos * 9
 
+    ref_h = f" (captura real del archivo: {h_archivo:.2f} d)" if h_archivo is not None else ""
     nota_target = ""
-    if "target" in datos:
-        ha_reales = int(np.sum(datos["target"] > 0.5)) * 9
-        nota_target = f"• Expansión real registrada (ground truth): ~{ha_reales} ha\n"
+    if target_2d is not None:
+        ha_reales = int(np.sum(target_2d > 0.5)) * 9
+        nota_target = f"• Expansión real registrada (contorno cian): ~{ha_reales} ha\n"
 
     reporte = (
         f"REPORTE DE INFERENCIA REAL (Zona 19.2 × 19.2 km | 64×64 px)\n"
         f"-------------------------------------------------------------\n"
-        f"• Horizonte evaluado (H): {h_final:.2f} días | Umbral: {BEST_THRESHOLD}\n"
-        f"• Cicatriz actual detectada (SCAR): {pixeles_actuales} px (~{ha_actuales} ha)\n"
-        f"• Quema nueva proyectada: {pixeles_nuevos} px (~{ha_nuevas} ha)\n"
+        f"• Horizonte evaluado (H): {h_final:.2f} días{ref_h}\n"
+        f"• Umbral de decisión: {BEST_THRESHOLD}\n"
+        f"• Cicatriz previa (rojo): {pixeles_actuales} px (~{ha_actuales} ha)\n"
+        f"• Propagación predicha (amarillo): {pixeles_nuevos} px (~{ha_nuevas} ha)\n"
         f"{nota_target}"
         f"• Probabilidad máxima en escena: {prob_quema.max()*100:.1f}%"
     )
@@ -137,7 +181,6 @@ def predecir_incendio(archivo_npz, h_usuario):
     return img_scar, img_pred, reporte
 
 
-# --- INTERFAZ GRADIO ---
 with gr.Blocks() as demo:
     gr.Markdown(
         """
@@ -159,9 +202,9 @@ with gr.Blocks() as demo:
             gr.Markdown("### 2. Horizonte Temporal")
             num_h = gr.Number(
                 label="Días a proyectar (H)",
-                info="Ingresa un valor mayor a 0 (ej. 0.5, 2, 5). Si pones 0, usa el horizonte original del archivo.",
-                value=2.0,
-                minimum=0.0,
+                info="Ingresa los días a futuro que quieres proyectar (ej. 0.5, 1, 2, 5).",
+                value=1.0,
+                minimum=0.25,
                 step=0.5,
                 elem_classes=["panel-card"]
             )
@@ -174,13 +217,13 @@ with gr.Blocks() as demo:
             gr.Markdown("### 3. Resultados del Modelo")
             with gr.Row():
                 out_scar = gr.Image(
-                    label="Cicatriz Actual (SCAR - Entrada f)",
-                    height=265,
+                    label="Cicatriz Actual (Rojo: Área quemada en t=0)",
+                    height=300,
                     elem_classes=["panel-card"]
                 )
                 out_pred = gr.Image(
-                    label="Probabilidad de Quema Nueva (f + H)",
-                    height=265,
+                    label="Propagación (Rojo: Base | Amarillo: Predicción | Cian: Real)",
+                    height=300,
                     elem_classes=["panel-card"]
                 )
 
@@ -198,7 +241,7 @@ with gr.Blocks() as demo:
     )
 
     btn_limpiar.click(
-        fn=lambda: [None, 2.0, None, None, ""],
+        fn=lambda: [None, 1.0, None, None, ""],
         inputs=[],
         outputs=[file_npz, num_h, out_scar, out_pred, out_status]
     )
