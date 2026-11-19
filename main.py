@@ -1,8 +1,22 @@
 import gradio as gr
 import numpy as np
 import cv2
+import torch
+from burn_scar.models.propagation import BurnScarPropagationModel
 
-# CSS personalizado para remarcar las casillas de subida y darles un aspecto limpio
+# --- 1. CARGA ÚNICA DEL MODELO ENTRENADO ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CKPT_PATH = "weights/best_fold_0.pt"
+
+ckpt = torch.load(CKPT_PATH, map_location=DEVICE, weights_only=False)
+MODEL_CONFIG = ckpt["model_config"]
+BEST_THRESHOLD = float(ckpt.get("metrics", {}).get("best_threshold", 0.2))
+
+model = BurnScarPropagationModel(**MODEL_CONFIG).to(DEVICE)
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval()
+
+# CSS para mantener la estética limpia con bordes definidos
 custom_css = """
 .sat-box {
     border: 2px dashed #94a3b8 !important;
@@ -23,125 +37,155 @@ custom_css = """
 """
 
 def hacer_mapa_calor(matriz_64x64):
-    """
-    Convierte una matriz de probabilidades (64x64, valores 0..1) en una imagen 
-    con mapa de calor (COLORMAP_INFERNO) reescalada a 320x320 sin difuminar los píxeles.
-    """
+    """Convierte matriz (64, 64) en [0, 1] a mapa de calor RGB reescalado a 320x320."""
     matriz_uint8 = np.clip(matriz_64x64 * 255, 0, 255).astype(np.uint8)
     mapa_bgr = cv2.applyColorMap(matriz_uint8, cv2.COLORMAP_INFERNO)
     mapa_rgb = cv2.cvtColor(mapa_bgr, cv2.COLOR_BGR2RGB)
-    mapa_grande = cv2.resize(mapa_rgb, (320, 320), interpolation=cv2.INTER_NEAREST)
-    return mapa_grande
+    return cv2.resize(mapa_rgb, (320, 320), interpolation=cv2.INTER_NEAREST)
 
-def predecir_incendio(olci, dem, wc, h):
-    if not olci or not dem or not wc:
-        return None, None, "Pendiente: Por favor, carga los 3 archivos satelitales (OLCI, DEM y WC) antes de continuar."
-    
-    if h is None or h <= 0:
-        return None, None, "Error: El horizonte de predicción (H) debe ser mayor a 0 días."
+def preprocesar_olci(olci_raw: np.ndarray) -> np.ndarray:
+    """Rellena NaNs con la media de su banda en ese frame y normaliza radiancia / 1000."""
+    olci = olci_raw.astype(np.float32).copy()
+    if olci.shape[0] < 7:
+        faltantes = 7 - olci.shape[0]
+        pad = np.repeat(olci[0:1], faltantes, axis=0)
+        olci = np.concatenate([pad, olci], axis=0)
+    for t in range(olci.shape[0]):
+        for b in range(olci.shape[1]):
+            banda = olci[t, b]
+            if np.isnan(banda).any():
+                media = np.nanmean(banda)
+                banda[np.isnan(banda)] = 0.0 if np.isnan(media) else media
+    return olci / 1000.0
 
-    # =========================================================================
-    # ZONA DE INTEGRACIÓN DEL MODELO (Para Antonio, Sebastián y Eduardo)
-    # =========================================================================
-    # 1. Cargar tensores desde: olci.name, dem.name, wc.name
-    # 2. Normalizar:
-    #    - OLCI: (7, 5, 64, 64) float32 -> dividir por 1000.0
-    #    - DEM:  (1, 64, 64) float32    -> dividir por 1000.0 (pasa a km)
-    #    - WC:   (1, 64, 64) float32    -> dividir por 100.0 (0 = sin dato)
-    # 3. Generar Entrada 4 (SCAR) con modelo congelado TMB-S3 (OLCI + WC en frame f)
-    # 4. Ejecutar modelo final: prob_quema_nueva = sigmoid(model(OLCI, DEM, WC, SCAR, H))
-    # =========================================================================
+def predecir_incendio(archivo_npz, h_usuario):
+    if archivo_npz is None:
+        return None, None, "Pendiente: Carga un archivo satelital (.npz) para ejecutar la inferencia."
 
-    # --- SIMULACIÓN VISUAL (Mientras se conecta el modelo PyTorch) ---
-    y, x = np.ogrid[:64, :64]
-    scar_simulado = np.exp(-((x - 28)**2 + (y - 32)**2) / 35.0)
-    desplazamiento = min(int(h * 2), 18)
-    quema_nueva_simulada = np.exp(-((x - (28 + desplazamiento))**2 + (y - 30)**2) / (50.0 + h * 8))
-    quema_nueva_simulada = np.clip(quema_nueva_simulada + np.random.uniform(0, 0.08, (64, 64)), 0, 1)
+    try:
+        datos = np.load(archivo_npz.name)
+    except Exception as e:
+        return None, None, f"Error al leer el archivo .npz: {e}"
 
-    img_scar = hacer_mapa_calor(scar_simulado)
-    img_pred = hacer_mapa_calor(quema_nueva_simulada)
+    requeridas = ["x_olci", "x_dem", "x_worldcover", "x_scar"]
+    faltantes = [k for k in requeridas if k not in datos]
+    if faltantes:
+        return None, None, f"Error: El archivo .npz no contiene las claves esperadas: {faltantes}"
 
-    # Cálculo de superficie: 1 píxel de 300x300 m = 9 hectáreas
-    pixeles_criticos = int(np.sum(quema_nueva_simulada > 0.5))
-    hectareas_riesgo = pixeles_criticos * 9
+    # 1. Preprocesamiento según contrato del modelo
+    olci = preprocesar_olci(datos["x_olci"])                      # (7, 5, 64, 64)
+    dem = datos["x_dem"].astype(np.float32) / 1000.0              # metros -> km
+    wc_raw = datos["x_worldcover"].astype(np.float32)
+    valid_fuel = wc_raw > 0                                       # clase 0 = sin dato/combustible
+    wc = np.where(valid_fuel, wc_raw / 100.0, 0.0)
+    scar = datos["x_scar"].astype(np.float32)
+
+    # Asegurar forma (1, 64, 64) en capas 2D
+    if dem.ndim == 2:
+        dem = dem[None]
+    if wc.ndim == 2:
+        wc = wc[None]
+    if scar.ndim == 2:
+        scar = scar[None]
+
+    # Usar días ingresados por el usuario o el horizonte propio del archivo si es <= 0
+    if h_usuario is not None and h_usuario > 0:
+        h_final = float(h_usuario)
+    elif "horizon_days" in datos:
+        h_final = float(datos["horizon_days"])
+    else:
+        h_final = 2.0
+
+    # 2. Inferencia con PyTorch
+    with torch.no_grad():
+        t_olci = torch.from_numpy(olci[None]).to(DEVICE)
+        t_dem = torch.from_numpy(dem[None]).to(DEVICE)
+        t_wc = torch.from_numpy(wc[None]).to(DEVICE)
+        t_scar = torch.from_numpy(scar[None]).to(DEVICE)
+        t_h = torch.tensor([h_final], dtype=torch.float32, device=DEVICE)
+
+        logits = model(t_olci, t_dem, t_wc, t_scar, t_h)
+        prob_quema = torch.sigmoid(logits).squeeze().cpu().numpy()
+
+    # Descartar zonas sin dato de combustible (clase WC == 0)
+    prob_quema = np.where(valid_fuel, prob_quema, 0.0)
+
+    # 3. Visualización y cálculo de hectáreas (1 píxel 300x300m = 9 ha)
+    img_scar = hacer_mapa_calor(scar.squeeze())
+    img_pred = hacer_mapa_calor(prob_quema)
+
+    pixeles_actuales = int(np.sum(scar.squeeze() > 0.5))
+    pixeles_nuevos = int(np.sum(prob_quema > BEST_THRESHOLD))
+    ha_actuales = pixeles_actuales * 9
+    ha_nuevas = pixeles_nuevos * 9
+
+    nota_target = ""
+    if "target" in datos:
+        ha_reales = int(np.sum(datos["target"] > 0.5)) * 9
+        nota_target = f"• Expansión real registrada (ground truth): ~{ha_reales} ha\n"
 
     reporte = (
-        f"RESUMEN DE LA PREDICCIÓN (Zona de 19.2 x 19.2 km | 64x64 px)\n"
-        f"------------------------------------------------------------\n"
-        f"• Horizonte proyectado (H): {h} días\n"
-        f"• Píxeles con alta prob. de quema (>50%): {pixeles_criticos} px\n"
-        f"• Superficie estimada de expansión: ~{hectareas_riesgo} hectáreas\n"
-        f"• Estado del pipeline: Entradas validadas (Modo Demo Activo)"
+        f"REPORTE DE INFERENCIA REAL (Zona 19.2 × 19.2 km | 64×64 px)\n"
+        f"-------------------------------------------------------------\n"
+        f"• Horizonte evaluado (H): {h_final:.2f} días | Umbral: {BEST_THRESHOLD}\n"
+        f"• Cicatriz actual detectada (SCAR): {pixeles_actuales} px (~{ha_actuales} ha)\n"
+        f"• Quema nueva proyectada: {pixeles_nuevos} px (~{ha_nuevas} ha)\n"
+        f"{nota_target}"
+        f"• Probabilidad máxima en escena: {prob_quema.max()*100:.1f}%"
     )
 
     return img_scar, img_pred, reporte
 
 
-# --- DISEÑO DE INTERFAZ ---
-with gr.Blocks(theme=gr.themes.Default(), css=custom_css) as demo:
+# --- INTERFAZ GRADIO ---
+with gr.Blocks() as demo:
     gr.Markdown(
         """
         # Sistema de Predicción de Propagación de Incendios (Sen2Fire)
-        **Demo de inferencia satelital** sobre cuadrículas locales de **19.2 × 19.2 km** (64×64 píxeles a 300 m de resolución).
+        **Inferencia en vivo (ConvLSTM + MiniSegFormer)** sobre cuadrículas locales de **19.2 × 19.2 km** (64×64 píxeles a 300 m).
         """
     )
 
     with gr.Row(equal_height=False):
-        # COLUMNA IZQUIERDA: Entradas con marcos definidos y sin solapamiento
         with gr.Column(scale=5):
-            gr.Markdown("### 1. Datos Satelitales de Entrada")
-            
-            file_olci = gr.File(
-                label="Secuencias Sentinel-3 OLCI (7 frames, 5 bandas)",
-                height=145,
+            gr.Markdown("### 1. Carga de Escena Satelital")
+            file_npz = gr.File(
+                label="Paquete Satelital del Evento (.npz: OLCI + DEM + WorldCover + SCAR)",
+                file_types=[".npz"],
+                height=170,
                 elem_classes=["sat-box"]
             )
-            
-            with gr.Row():
-                file_dem = gr.File(
-                    label="Mapa de Elevación (DEM GLO30)",
-                    height=145,
-                    elem_classes=["sat-box"]
-                )
-                file_wc = gr.File(
-                    label="Uso de Suelo (WorldCover v200)",
-                    height=145,
-                    elem_classes=["sat-box"]
-                )
 
-            gr.Markdown("### 2. Parámetros de Proyección")
+            gr.Markdown("### 2. Horizonte Temporal")
             num_h = gr.Number(
-                label="Horizonte de predicción H (en días)",
-                info="Ej: 0.5 (12 horas), 2 (dos días), 7 (una semana). La cicatriz actual (SCAR) se calcula internamente con TMB-S3.",
+                label="Días a proyectar (H)",
+                info="Ingresa un valor mayor a 0 (ej. 0.5, 2, 5). Si pones 0, usa el horizonte original del archivo.",
                 value=2.0,
-                minimum=0.1,
+                minimum=0.0,
                 step=0.5,
                 elem_classes=["panel-card"]
             )
 
             with gr.Row():
-                btn_limpiar = gr.Button("Limpiar datos", variant="secondary")
+                btn_limpiar = gr.Button("Limpiar", variant="secondary")
                 btn_predecir = gr.Button("Calcular Predicción", variant="primary")
 
-        # COLUMNA DERECHA: Salidas visuales y panel de métricas
         with gr.Column(scale=6):
-            gr.Markdown("### 3. Mapas de Probabilidad y Métricas")
-            
+            gr.Markdown("### 3. Resultados del Modelo")
             with gr.Row():
                 out_scar = gr.Image(
-                    label="Cicatriz Actual (SCAR - Modelo TMB-S3)",
+                    label="Cicatriz Actual (SCAR - Entrada f)",
                     height=265,
                     elem_classes=["panel-card"]
                 )
                 out_pred = gr.Image(
-                    label="Predicción de Quema Nueva (Salida Sigmoid)",
+                    label="Probabilidad de Quema Nueva (f + H)",
                     height=265,
                     elem_classes=["panel-card"]
                 )
-            
+
             out_status = gr.Textbox(
-                label="Reporte de Superficie y Estado",
+                label="Métricas de Superficie y Validación",
                 lines=6,
                 interactive=False,
                 elem_classes=["panel-card"]
@@ -149,15 +193,15 @@ with gr.Blocks(theme=gr.themes.Default(), css=custom_css) as demo:
 
     btn_predecir.click(
         fn=predecir_incendio,
-        inputs=[file_olci, file_dem, file_wc, num_h],
+        inputs=[file_npz, num_h],
         outputs=[out_scar, out_pred, out_status]
     )
 
     btn_limpiar.click(
-        fn=lambda: [None, None, None, 2.0, None, None, ""],
+        fn=lambda: [None, 2.0, None, None, ""],
         inputs=[],
-        outputs=[file_olci, file_dem, file_wc, num_h, out_scar, out_pred, out_status]
+        outputs=[file_npz, num_h, out_scar, out_pred, out_status]
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(theme=gr.themes.Default(), css=custom_css)
